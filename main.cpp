@@ -22,10 +22,10 @@
 #define wcs_crash do {__asm int 3} while
 
 // check alignment
-#define wcs_is_aligned( address, alignment ) ( !(((unsigned int)address) & (alignment - 1)) )
+#define wcs_is_aligned( address, alignment ) ( !(((DWORD)address) & (alignment - 1)) )
 
 // get offset of a structure member
-#define wcs_offset_of(type, member) ( (unsigned int) &( (type *) 0 )->member )
+#define wcs_offset_of(type, member) ( (DWORD) &( (type *) 0 )->member )
 
 // ============================================================================
 // simulated ukernel
@@ -34,13 +34,14 @@
 typedef struct
 {
     // pointer to the stack - updated on context switch
-    unsigned char *stack;
-
-	unsigned char *stack_base;
+    byte *stack;
+	byte *stack_base;
 	uint64_t nr_thread_switches;
 
     // name, for debugging
     std::string name;
+	// experimental
+	CONTEXT ctx;
 }
 THREAD_CONTROL_BLOCK;
 
@@ -85,11 +86,11 @@ void wcs_set_running_thread_tcb(THREAD_CONTROL_BLOCK *tcb)
 uint64_t total_nr_thread_switches = 0;
 
 // create a thread
-THREAD_CONTROL_BLOCK * wcs_thread_create(const char *name, const unsigned int stack_size,
+THREAD_CONTROL_BLOCK * wcs_thread_create(const char *name, const DWORD stack_size,
                        const THREAD_PROC entry, void *argument)
 {
     // check stack alignment
-    wcs_assert(wcs_is_aligned(stack_size, sizeof(unsigned int)));
+    wcs_assert(wcs_is_aligned(stack_size, sizeof(DWORD)));
 
     // allocate a TCB
     THREAD_CONTROL_BLOCK *thread_tcb = new THREAD_CONTROL_BLOCK;
@@ -100,7 +101,7 @@ THREAD_CONTROL_BLOCK * wcs_thread_create(const char *name, const unsigned int st
 	thread_tcb->nr_thread_switches = 0;
 
     // allocate the thread stack
-    unsigned char *thread_stack = new unsigned char[stack_size];
+    byte *thread_stack = new byte[stack_size];
     wcs_assert(thread_stack != nullptr);
 
 	thread_tcb->stack_base = thread_stack;
@@ -114,17 +115,17 @@ THREAD_CONTROL_BLOCK * wcs_thread_create(const char *name, const unsigned int st
     
     // set the thread stack in the TCB to the end of the stack block (since 
     // it grows upwards) and point to the first dword we can write to
-    unsigned int *current_stack_position = (unsigned int *)((thread_stack + stack_size) - sizeof(unsigned int));
+    DWORD *current_stack_position = (DWORD *)((thread_stack + stack_size) - sizeof(DWORD));
 
     // push argument 
-    *current_stack_position-- = (unsigned int)argument;
+    *current_stack_position-- = (DWORD)argument;
 
     // this is the address of the routine to be called when a 
     // thread returns from its thread entry
-    *current_stack_position-- = (unsigned int)wcs_thread_entry_return;
+    *current_stack_position-- = (DWORD)wcs_thread_entry_return;
 
     // push entry 
-    *current_stack_position-- = (unsigned int)entry;
+    *current_stack_position-- = (DWORD)entry;
 
     // push status word.
 	// will be loaded by popdf
@@ -143,37 +144,12 @@ THREAD_CONTROL_BLOCK * wcs_thread_create(const char *name, const unsigned int st
     *current_stack_position      = 0xb0;        // edi 
 
     // set current position in stack 
-    thread_tcb->stack = (unsigned char *)current_stack_position;
+    thread_tcb->stack = (byte *)current_stack_position;
 
     // shove thread to ready list
     ready_threads_queue.push(thread_tcb);
 
 	return thread_tcb;
-}
-
-// simulated tick ISR, called in main thread context via thread hijack 
-__declspec(naked) void hijacked_kernel_thread_tick_isr()
-{
-    //
-    // Save running thread context
-    //
-    __asm
-    {
-        // push status word and all registers  
-        pushfd
-        pushad
-
-        // push stack ptr to running thread
-        mov edx, running_thread
-        mov [edx + WCS_THREAD_TCB_STACK_PTR_OFFSET], esp
-    }
-
-    interrupt_simulator_thread_reschedule();
-
-    // in this simplistic demo, we'll never get here. in the real world,
-    // we may get here if the kernel has no ready thread to execute. we'd 
-    // need to restore the thread we interrupted and continue
-    wcs_crash(0);
 }
 
 // reschedule the next ready thread
@@ -214,6 +190,31 @@ void interrupt_simulator_thread_reschedule()
     }
 }
 
+// simulated tick ISR, called in main thread context via thread hijack 
+__declspec(naked) void hijacked_kernel_thread_tick_isr()
+{
+    //
+    // Save running thread context
+    //
+    __asm
+    {
+        // push status word and all registers  
+        pushfd
+        pushad
+
+        // push stack ptr to running thread
+        mov edx, running_thread
+        mov [edx + WCS_THREAD_TCB_STACK_PTR_OFFSET], esp
+    }
+
+    interrupt_simulator_thread_reschedule();
+
+    // in this simplistic demo, we'll never get here. in the real world,
+    // we may get here if the kernel has no ready thread to execute. we'd 
+    // need to restore the thread we interrupted and continue
+    wcs_crash(0);
+}
+
 // ============================================================================
 // Interrupt simulator thread
 // ============================================================================
@@ -236,18 +237,26 @@ void interrupt_simulator_thread_handle_raised_interrupt(HANDLE kernel_thread_han
     // initialize context flags 
     CONTEXT ctx;
 
-    // suspend the kernel thread
+    // suspend the kernel thread (this won't abort an active time-slice)
     SuspendThread(kernel_thread_handle_to_interrupt);
 
-    // get its windows thread context
+    // get the windows thread context of the kernel thread
     memset(&ctx, 0, sizeof(ctx));
     ctx.ContextFlags = CONTEXT_FULL;
+	// MSDN explains GetThreadContext cannot get a valid context for a running thread,
+	// thus requires call to SuspendThread first, which implies the thread is guaranteed
+	// to be suspended only after this call :
     GetThreadContext(kernel_thread_handle_to_interrupt, &ctx);
+
+	if (running_thread)
+		memcpy(&(running_thread->ctx), &ctx, sizeof(ctx));
+	else
+		ctx.ContextFlags = CONTEXT_FULL; // no-op for breakpoint purposes
 
     // push the address we want to return to (which is wherever the thread is now)
     // after our simulated ISR to the thread's stack
-    ctx.Esp -= sizeof(unsigned int *);
-    *(unsigned int *)ctx.Esp = ctx.Eip;
+    ctx.Esp -= sizeof(DWORD);
+    *((DWORD *)ctx.Esp) = ctx.Eip;
 
     // set the instruction pointer of the kernel thread to that of the ISR routine
     ctx.Eip = (DWORD)hijacked_kernel_thread_tick_isr;
@@ -259,13 +268,20 @@ void interrupt_simulator_thread_handle_raised_interrupt(HANDLE kernel_thread_han
     ResumeThread(kernel_thread_handle_to_interrupt);
 }
 
-DWORD WINAPI interrupt_simulator_thread_entry_proc(void *kernel_thread_handle)
+DWORD WINAPI interrupt_simulator_thread_proc(void *kernel_thread_handle)
 {
     MSG interrupt_simulator_thread_message;
 
     // forever 
     while (1)
     {
+		// TODO : An alternative to a timer posting messages,
+		// interrupt frequency could be handled here using
+		// self-tuning timing mechanism, using things like :
+		// * if(!SwitchToThread()) Sleep(0); 
+		// * spin-loop with QueryPerformanceCounter() / RDTSC
+		// See http://www.windowstimestamp.com/description
+
         // get windows message 
         switch (GetMessage(&interrupt_simulator_thread_message, nullptr, MSG_RAISE_INTERRUPT, WCS_INTSIM_MSG_LAST))
         {
@@ -294,26 +310,35 @@ DWORD WINAPI interrupt_simulator_thread_entry_proc(void *kernel_thread_handle)
     }
 }
 
-
-// interrupt registered thread, called from periodic timer
-void CALLBACK interrupt_simulator_thread_periodic_timer_expiration(void *param, BOOLEAN dummy)
+// interrupt registered thread, called from periodic timer (executing in
+// a thread, separate from kernel_thread and interrupt_simulator_thread)
+void CALLBACK interrupt_simulator_periodic_timer_expiration(void *param, BOOLEAN dummy)
 {
 	DWORD interrupt_simulator_thread_id = (DWORD)param;
 
     // send a message, don't wait 
-    PostThreadMessage(interrupt_simulator_thread_id, MSG_RAISE_INTERRUPT, 0, 0);
+	PostThreadMessage(interrupt_simulator_thread_id, MSG_RAISE_INTERRUPT, 0, 0);
 }
 
-void initialize_interrupt_simulator(const HANDLE kernel_thread_handle)
+void initialize_interrupt_simulator()
 {
-	/*static*/ HANDLE interrupt_simulator_thread_handle;
-	/*static*/ DWORD interrupt_simulator_thread_id;
+	// get a duplicate handle for the current thread, to gain suspend/resume rights
+	HANDLE kernel_thread_handle;
+	DuplicateHandle(GetCurrentProcess(),
+		GetCurrentThread(),
+		GetCurrentProcess(),
+		&kernel_thread_handle,
+		0,
+		TRUE,
+		DUPLICATE_SAME_ACCESS);
 
     // spawn interrupt thread 
+	/*static*/ HANDLE interrupt_simulator_thread_handle;
+	/*static*/ DWORD interrupt_simulator_thread_id;
     interrupt_simulator_thread_handle = CreateThread(
 		nullptr, 
 		0, 
-		interrupt_simulator_thread_entry_proc,
+		interrupt_simulator_thread_proc,
         /*Parameter=*/kernel_thread_handle,
         0,
 		&interrupt_simulator_thread_id);
@@ -321,25 +346,20 @@ void initialize_interrupt_simulator(const HANDLE kernel_thread_handle)
     // make sure the interrupt thread has highest priority so it can preempt the kernel thread
     BOOL result = SetThreadPriority(interrupt_simulator_thread_handle, THREAD_PRIORITY_HIGHEST);
 
-    // wcs_intsim_start_periodic_interrupt();
-    // start the periodic timer interrupt, simulating a round robin time-slicing
-
-	// timer handle (no need for it)
-    HANDLE periodic_timer_handle;
-
-    // create the timer, expiring periodically
-    result = CreateTimerQueueTimer(&periodic_timer_handle, 
-                                        CreateTimerQueue(), 
-                                        (WAITORTIMERCALLBACK)interrupt_simulator_thread_periodic_timer_expiration,
-                                        /*Parameter=*/(void *)interrupt_simulator_thread_id,
-                                        /*DueTime=*/100, // wait a bit to allow wcs_intsim_thread_handle to create messages
+    // start the periodic timer interrupt using a periodically expiring timer, simulating a round robin time-slicing
+	HANDLE periodic_timer_handle; // timer handle (no need for it)
+	result = CreateTimerQueueTimer(&periodic_timer_handle, 
+										CreateTimerQueue(), 
+										(WAITORTIMERCALLBACK)interrupt_simulator_periodic_timer_expiration,
+										/*Parameter=*/(void *)interrupt_simulator_thread_id,
+										/*DueTime=*/100, // wait a bit to allow wcs_intsim_thread_handle to create messages
 		// TODO : Low values (high frequencies) lead to exceptions - why?
 		// See https://github.com/pavius/preemptive-kernel-in-win-thread/issues/1
-                                        8, // ms, was 500
-                                        0);
+										10, // ms, was 500
+										0);
 
-    /* make sure */
-    wcs_assert(result == TRUE);
+	/* make sure */
+	wcs_assert(result == TRUE);
 }
 
 // ============================================================================
@@ -373,24 +393,6 @@ void thread_entry(void *argument)
     }
 }
 
-// get current thread handle
-HANDLE get_main_thread_handle()
-{
-    HANDLE main_thread_handle = 0;
-
-    // get a duplicate handle for the current thread, to gain suspend/resume rights
-    DuplicateHandle(GetCurrentProcess(),
-                     GetCurrentThread(),
-                     GetCurrentProcess(),
-                     &main_thread_handle,
-                     0,
-                     TRUE,
-                     DUPLICATE_SAME_ACCESS);
-
-    // return it
-    return main_thread_handle;
-}
-
 int main(int argc, char* argv[])
 {
     // create threads
@@ -399,7 +401,7 @@ int main(int argc, char* argv[])
     t3 = wcs_thread_create("t3", 64 * 1024, thread_entry, (void *)" t  3  ");
     t4 = wcs_thread_create("t4", 64 * 1024, thread_entry, (void *)" t   4 ");
 
-	initialize_interrupt_simulator(get_main_thread_handle());
+	initialize_interrupt_simulator();
 
     // start threads
     interrupt_simulator_thread_reschedule();
